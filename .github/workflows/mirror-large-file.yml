@@ -1,0 +1,95 @@
+name: Mirror Large File To Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "Direct download URL"
+        required: true
+        type: string
+
+      release_tag:
+        description: "Release tag name"
+        required: true
+        type: string
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 wget coreutils jq
+
+      - name: Prepare directories
+        run: |
+          mkdir -p downloads
+          mkdir -p parts
+
+      - name: Get filename
+        id: filename
+        run: |
+          FILE_URL="${{ github.event.inputs.file_url }}"
+          FILE_NAME=$(basename "${FILE_URL%%\?*}")
+
+          echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Parallel resumable download
+        run: |
+          aria2c \
+            --continue=true \
+            --max-connection-per-server=16 \
+            --split=16 \
+            --min-split-size=1M \
+            --file-allocation=none \
+            --dir=downloads \
+            --out="${{ steps.filename.outputs.file_name }}" \
+            "${{ github.event.inputs.file_url }}"
+
+      - name: Generate checksum
+        run: |
+          sha256sum \
+            "downloads/${{ steps.filename.outputs.file_name }}" \
+            > "parts/${{ steps.filename.outputs.file_name }}.sha256"
+
+      - name: Split into 95MB parts
+        run: |
+          split \
+            -b 95M \
+            -d \
+            -a 5 \
+            "downloads/${{ steps.filename.outputs.file_name }}" \
+            "parts/${{ steps.filename.outputs.file_name }}.part."
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.release_tag }}"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Large file mirror release"
+          fi
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.release_tag }}"
+
+          find parts -type f | while read FILE; do
+            echo "Uploading $FILE"
+
+            gh release upload "$TAG" "$FILE" \
+              --clobber
+          done
